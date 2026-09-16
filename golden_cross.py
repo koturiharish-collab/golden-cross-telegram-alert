@@ -130,34 +130,41 @@ def check_stock(symbol, state):
         if data.empty or len(data) < 205:
             return
 
-        data["SMA50"] = (
-            data["Close"].rolling(50).mean()
+        # 50 EMA
+        data["EMA50"] = (
+            data["Close"]
+            .ewm(span=50, adjust=False)
+            .mean()
         )
 
-        data["SMA200"] = (
-            data["Close"].rolling(200).mean()
+        # 200 EMA
+        data["EMA200"] = (
+            data["Close"]
+            .ewm(span=200, adjust=False)
+            .mean()
         )
 
         previous = data.iloc[-2]
         current = data.iloc[-1]
 
         if (
-            pd.isna(previous["SMA50"])
-            or pd.isna(previous["SMA200"])
-            or pd.isna(current["SMA50"])
-            or pd.isna(current["SMA200"])
+            pd.isna(previous["EMA50"])
+            or pd.isna(previous["EMA200"])
+            or pd.isna(current["EMA50"])
+            or pd.isna(current["EMA200"])
         ):
             return
 
         # Fresh Golden Cross:
         # Previous completed day:
-        # 50 SMA <= 200 SMA
+        # 50 EMA <= 200 EMA
         #
         # Latest completed day:
-        # 50 SMA > 200 SMA
+        # 50 EMA > 200 EMA
+
         fresh_cross = (
-            previous["SMA50"] <= previous["SMA200"]
-            and current["SMA50"] > current["SMA200"]
+            previous["EMA50"] <= previous["EMA200"]
+            and current["EMA50"] > current["EMA200"]
         )
 
         if not fresh_cross:
@@ -170,8 +177,8 @@ def check_stock(symbol, state):
             return
 
         close_price = float(current["Close"])
-        sma50 = float(current["SMA50"])
-        sma200 = float(current["SMA200"])
+        ema50 = float(current["EMA50"])
+        ema200 = float(current["EMA200"])
 
         message = (
             "🟢 FRESH GOLDEN CROSS\n\n"
@@ -179,9 +186,9 @@ def check_stock(symbol, state):
             f"Timeframe: 1 DAY\n"
             f"Cross Date: {cross_date}\n"
             f"Close: ₹{close_price:.2f}\n"
-            f"50 SMA: ₹{sma50:.2f}\n"
-            f"200 SMA: ₹{sma200:.2f}\n\n"
-            "50 SMA crossed ABOVE 200 SMA."
+            f"50 EMA: ₹{ema50:.2f}\n"
+            f"200 EMA: ₹{ema200:.2f}\n\n"
+            "50 EMA crossed ABOVE 200 EMA."
         )
 
         send_telegram(message)
