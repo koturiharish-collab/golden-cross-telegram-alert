@@ -1,7 +1,8 @@
 import os
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -20,9 +21,35 @@ STATE_FILE = "alert_state.json"
 EMA_FAST = 50
 EMA_SLOW = 200
 
+IST = ZoneInfo("Asia/Kolkata")
+
+# NSE regular market timing
+MARKET_OPEN = dt_time(9, 15)
+MARKET_CLOSE = dt_time(15, 30)
+
 NIFTY_500_URL = (
     "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
 )
+
+
+# ============================================================
+# IST TIME
+# ============================================================
+
+def now_ist():
+    return datetime.now(IST)
+
+
+def is_market_open_now():
+    current = now_ist()
+
+    # Monday = 0, Sunday = 6
+    if current.weekday() >= 5:
+        return False
+
+    current_time = current.time()
+
+    return MARKET_OPEN <= current_time < MARKET_CLOSE
 
 
 # ============================================================
@@ -62,6 +89,7 @@ def send_telegram(message):
     except Exception as e:
 
         print("Telegram error:", e)
+
         return False
 
 
@@ -124,6 +152,7 @@ def get_nse_symbols():
         if "Symbol" not in df.columns:
 
             print("NSE Symbol column not found.")
+
             return []
 
         symbols = (
@@ -173,6 +202,7 @@ def get_stock_data(symbol):
         )
 
         if df is None or df.empty:
+
             return None
 
         # Yahoo sometimes returns MultiIndex columns
@@ -184,6 +214,7 @@ def get_stock_data(symbol):
             )
 
         if "Close" not in df.columns:
+
             return None
 
         df = df[["Close"]].copy()
@@ -196,7 +227,29 @@ def get_stock_data(symbol):
         df.dropna(inplace=True)
 
         if len(df) < 210:
+
             return None
+
+        # ----------------------------------------------------
+        # NORMALIZE DATE
+        # ----------------------------------------------------
+
+        df.index = pd.to_datetime(
+            df.index,
+            errors="coerce"
+        )
+
+        df = df[~df.index.isna()]
+
+        # Convert timezone-aware timestamps to IST
+        if getattr(df.index, "tz", None) is not None:
+
+            df.index = df.index.tz_convert(IST).tz_localize(None)
+
+        else:
+
+            # Yahoo daily NSE timestamps are treated as trading dates
+            df.index = df.index.normalize()
 
         return df
 
@@ -210,6 +263,59 @@ def get_stock_data(symbol):
 
 
 # ============================================================
+# REMOVE ONLY THE CURRENT INCOMPLETE CANDLE
+# ============================================================
+
+def get_completed_daily_data(df):
+
+    if df is None or df.empty:
+
+        return None
+
+    current_ist = now_ist()
+
+    today = pd.Timestamp(
+        current_ist.date()
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # BEFORE 15:30 IST:
+    # today's daily candle is still forming.
+    #
+    # AFTER 15:30 IST:
+    # today's candle is considered completed.
+    # --------------------------------------------------------
+
+    if is_market_open_now():
+
+        df = df[
+            df.index < today
+        ].copy()
+
+        print(
+            "IST:",
+            current_ist.strftime("%Y-%m-%d %H:%M:%S"),
+            "| Market OPEN",
+            "| Today's candle excluded"
+        )
+
+    else:
+
+        df = df.copy()
+
+        print(
+            "IST:",
+            current_ist.strftime("%Y-%m-%d %H:%M:%S"),
+            "| Market CLOSED",
+            "| Latest completed candle included"
+        )
+
+    return df
+
+
+# ============================================================
 # CHECK FRESH GOLDEN CROSS
 # ============================================================
 
@@ -218,19 +324,25 @@ def check_golden_cross(symbol):
     df = get_stock_data(symbol)
 
     if df is None:
+
         return None
 
     # --------------------------------------------------------
-    # REMOVE CURRENT / POSSIBLY UNFINISHED DAILY CANDLE
+    # KEEP ONLY COMPLETED DAILY CANDLES
     # --------------------------------------------------------
 
-    completed = df.iloc[:-1].copy()
+    completed = get_completed_daily_data(df)
+
+    if completed is None:
+
+        return None
 
     if len(completed) < 205:
+
         return None
 
     # --------------------------------------------------------
-    # CALCULATE 50 EMA AND 200 EMA
+    # CALCULATE EMA 50
     # --------------------------------------------------------
 
     completed["EMA50"] = (
@@ -242,6 +354,10 @@ def check_golden_cross(symbol):
         .mean()
     )
 
+    # --------------------------------------------------------
+    # CALCULATE EMA 200
+    # --------------------------------------------------------
+
     completed["EMA200"] = (
         completed["Close"]
         .ewm(
@@ -252,10 +368,11 @@ def check_golden_cross(symbol):
     )
 
     # --------------------------------------------------------
-    # LAST TWO COMPLETED DAILY CANDLES
+    # LAST TWO COMPLETED CANDLES
     # --------------------------------------------------------
 
     previous = completed.iloc[-2]
+
     current = completed.iloc[-1]
 
     previous_50 = float(
@@ -275,7 +392,7 @@ def check_golden_cross(symbol):
     )
 
     # --------------------------------------------------------
-    # TRUE FRESH GOLDEN CROSS
+    # FRESH GOLDEN CROSS
     #
     # PREVIOUS:
     # 50 EMA <= 200 EMA
@@ -290,6 +407,15 @@ def check_golden_cross(symbol):
         current_50 > current_200
     )
 
+    print(
+        f"{symbol}: "
+        f"Previous 50={previous_50:.2f}, "
+        f"Previous 200={previous_200:.2f}, "
+        f"Current 50={current_50:.2f}, "
+        f"Current 200={current_200:.2f}, "
+        f"FreshGolden={fresh_cross}"
+    )
+
     if not fresh_cross:
 
         return None
@@ -300,10 +426,7 @@ def check_golden_cross(symbol):
 
     cross_date = current.name
 
-    if hasattr(
-        cross_date,
-        "strftime"
-    ):
+    if hasattr(cross_date, "strftime"):
 
         cross_date = cross_date.strftime(
             "%Y-%m-%d"
@@ -328,7 +451,6 @@ def check_golden_cross(symbol):
         "ema50": current_50,
 
         "ema200": current_200
-
     }
 
 
@@ -338,16 +460,34 @@ def check_golden_cross(symbol):
 
 def main():
 
-    print("=" * 65)
+    print("=" * 70)
     print("NSE FRESH GOLDEN CROSS SCANNER")
-    print("=" * 65)
+    print("=" * 70)
+
+    current_ist = now_ist()
 
     print(
-        "Run time:",
+        "India Time:",
+        current_ist.strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+    )
+
+    print(
+        "UTC Time:",
         datetime.now(
             timezone.utc
-        ).isoformat()
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
     )
+
+    print(
+        "Market Status:",
+        "OPEN" if is_market_open_now() else "CLOSED"
+    )
+
+    print("=" * 70)
 
     state = load_state()
 
@@ -356,6 +496,7 @@ def main():
     if not symbols:
 
         print("No symbols received.")
+
         return
 
     new_alerts = 0
@@ -379,16 +520,18 @@ def main():
         )
 
         if result is None:
+
             continue
 
         # ----------------------------------------------------
         # UNIQUE ALERT
         #
-        # SAME STOCK + SAME DATE
+        # SAME STOCK + SAME CROSS DATE
         # = SAME ALERT
         # ----------------------------------------------------
 
         alert_key = (
+            f"GOLDEN_"
             f"{result['symbol']}_"
             f"{result['cross_date']}"
         )
@@ -416,9 +559,11 @@ def main():
             f"📈 50 EMA: ₹{result['ema50']:.2f}\n"
             f"📉 200 EMA: ₹{result['ema200']:.2f}\n\n"
 
-            "⚠️ 50 EMA crossed ABOVE 200 EMA\n\n"
+            "✅ 50 EMA crossed ABOVE 200 EMA\n\n"
 
-            f"🔗 Stock:\n"
+            "🇮🇳 Timezone: Asia/Kolkata\n\n"
+
+            "🔗 Stock:\n"
             f"https://finance.yahoo.com/quote/"
             f"{result['symbol']}.NS/\n\n"
 
@@ -450,9 +595,7 @@ def main():
                     result["ema200"],
 
                 "sent_at":
-                    datetime.now(
-                        timezone.utc
-                    ).isoformat()
+                    now_ist().isoformat()
             }
 
             save_state(state)
@@ -474,7 +617,7 @@ def main():
         time.sleep(0.3)
 
     print()
-    print("=" * 65)
+    print("=" * 70)
     print("SCAN FINISHED")
     print(
         "New alerts:",
@@ -484,8 +627,13 @@ def main():
         "Total saved alerts:",
         len(state)
     )
-    print("=" * 65)
+    print("=" * 70)
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
+
     main()
