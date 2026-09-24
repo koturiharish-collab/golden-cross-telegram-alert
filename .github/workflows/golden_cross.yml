@@ -2,7 +2,8 @@ name: NSE Fresh Golden Cross Alert
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    # 10:15 UTC = 15:45 IST
+    - cron: "15 10 * * 1-5"
 
   workflow_dispatch:
 
@@ -52,8 +53,8 @@ jobs:
       # --------------------------------------------------
       - name: Ensure alert state exists
         run: |
-          if [ ! -f golden_alert_state.json ]; then
-            echo "{}" > golden_alert_state.json
+          if [ ! -f alert_state.json ]; then
+            echo "{}" > alert_state.json
           fi
 
       # --------------------------------------------------
@@ -64,7 +65,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add golden_alert_state.json
+          git add alert_state.json
 
           git diff --cached --quiet || git commit -m "Update golden cross alert state"
 
