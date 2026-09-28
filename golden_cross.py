@@ -1,639 +1,118 @@
-import os
+"""Golden Cross (SMA50 crosses above SMA200) scanner on the DAILY timeframe.
+Sends fresh alerts to Telegram. Dedupes via state.json so each cross alerts once.
+Usage: python golden_cross_alert.py [--test]
+"""
 import json
-import time
-from datetime import datetime, timezone, time as dt_time
-from zoneinfo import ZoneInfo
+import os
+import sys
+from pathlib import Path
 
-import pandas as pd
 import requests
 import yfinance as yf
 
+FAST = int(os.getenv("FAST_MA", 50))
+SLOW = int(os.getenv("SLOW_MA", 200))
+FRESH_BARS = int(os.getenv("FRESH_BARS", 1))  # cross must be within last N daily bars
+INCLUDE_LIVE_BAR = os.getenv("INCLUDE_LIVE_BAR", "true").lower() == "true"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-STATE_FILE = "alert_state.json"
-
-EMA_FAST = 50
-EMA_SLOW = 200
-
-IST = ZoneInfo("Asia/Kolkata")
-
-# NSE regular market timing
-MARKET_OPEN = dt_time(9, 15)
-MARKET_CLOSE = dt_time(15, 30)
-
-NIFTY_500_URL = (
-    "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-)
+STATE_FILE = Path("state.json")
+SYMBOLS_FILE = Path("symbols.txt")
 
 
-# ============================================================
-# IST TIME
-# ============================================================
+def load_symbols():
+    lines = SYMBOLS_FILE.read_text().splitlines()
+    return [l.split("#")[0].strip() for l in lines if l.split("#")[0].strip()]
 
-def now_ist():
-    return datetime.now(IST)
-
-
-def is_market_open_now():
-    current = now_ist()
-
-    # Monday = 0, Sunday = 6
-    if current.weekday() >= 5:
-        return False
-
-    current_time = current.time()
-
-    return MARKET_OPEN <= current_time < MARKET_CLOSE
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: Telegram secrets are missing.")
-        return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=20
-        )
-
-        print("Telegram status:", response.status_code)
-        print("Telegram response:", response.text[:500])
-
-        return response.ok
-
-    except Exception as e:
-
-        print("Telegram error:", e)
-
-        return False
-
-
-# ============================================================
-# LOAD STATE
-# ============================================================
 
 def load_state():
-
-    if not os.path.exists(STATE_FILE):
-        return {}
-
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except Exception:
-
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-# ============================================================
-# SAVE STATE
-# ============================================================
-
-def save_state(state):
-
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            state,
-            f,
-            indent=2,
-            sort_keys=True
-        )
+def send_telegram(text):
+    r = requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+              "disable_web_page_preview": True},
+        timeout=20,
+    )
+    r.raise_for_status()
 
 
-# ============================================================
-# GET NSE SYMBOLS
-# ============================================================
-
-def get_nse_symbols():
-
-    print("Downloading NSE NIFTY 500 list...")
-
-    try:
-
-        df = pd.read_csv(NIFTY_500_URL)
-
-        if "Symbol" not in df.columns:
-
-            print("NSE Symbol column not found.")
-
-            return []
-
-        symbols = (
-            df["Symbol"]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .tolist()
-        )
-
-        symbols = sorted(set(symbols))
-
-        print(
-            "Total NSE symbols:",
-            len(symbols)
-        )
-
-        return symbols
-
-    except Exception as e:
-
-        print(
-            "Unable to download NSE list:",
-            e
-        )
-
-        return []
-
-
-# ============================================================
-# GET DAILY STOCK DATA
-# ============================================================
-
-def get_stock_data(symbol):
-
-    ticker = f"{symbol}.NS"
-
-    try:
-
-        df = yf.download(
-            ticker,
-            period="2y",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False
-        )
-
-        if df is None or df.empty:
-
-            return None
-
-        # Yahoo sometimes returns MultiIndex columns
-        if isinstance(df.columns, pd.MultiIndex):
-
-            df.columns = (
-                df.columns
-                .get_level_values(0)
-            )
-
-        if "Close" not in df.columns:
-
-            return None
-
-        df = df[["Close"]].copy()
-
-        df["Close"] = pd.to_numeric(
-            df["Close"],
-            errors="coerce"
-        )
-
-        df.dropna(inplace=True)
-
-        if len(df) < 210:
-
-            return None
-
-        # ----------------------------------------------------
-        # NORMALIZE DATE
-        # ----------------------------------------------------
-
-        df.index = pd.to_datetime(
-            df.index,
-            errors="coerce"
-        )
-
-        df = df[~df.index.isna()]
-
-        # Convert timezone-aware timestamps to IST
-        if getattr(df.index, "tz", None) is not None:
-
-            df.index = df.index.tz_convert(IST).tz_localize(None)
-
-        else:
-
-            # Yahoo daily NSE timestamps are treated as trading dates
-            df.index = df.index.normalize()
-
-        return df
-
-    except Exception as e:
-
-        print(
-            f"{symbol}: data error -> {e}"
-        )
-
+def find_fresh_cross(symbol):
+    """Return dict for the most recent golden cross within FRESH_BARS, else None."""
+    df = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=True)
+    close = df["Close"].dropna()
+    if not INCLUDE_LIVE_BAR and len(close) > 1:
+        # Drop today's still-forming candle if the market is open / bar is today
+        if close.index[-1].date() == __import__("datetime").date.today():
+            close = close.iloc[:-1]
+    if len(close) < SLOW + 2:
+        print(f"[skip] {symbol}: only {len(close)} bars")
         return None
 
-
-# ============================================================
-# REMOVE ONLY THE CURRENT INCOMPLETE CANDLE
-# ============================================================
-
-def get_completed_daily_data(df):
-
-    if df is None or df.empty:
-
+    diff = close.rolling(FAST).mean() - close.rolling(SLOW).mean()
+    crossed = (diff.shift(1) <= 0) & (diff > 0)
+    recent = crossed.iloc[-FRESH_BARS:]
+    if not recent.any():
         return None
 
-    current_ist = now_ist()
-
-    today = pd.Timestamp(
-        current_ist.date()
-    )
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # BEFORE 15:30 IST:
-    # today's daily candle is still forming.
-    #
-    # AFTER 15:30 IST:
-    # today's candle is considered completed.
-    # --------------------------------------------------------
-
-    if is_market_open_now():
-
-        df = df[
-            df.index < today
-        ].copy()
-
-        print(
-            "IST:",
-            current_ist.strftime("%Y-%m-%d %H:%M:%S"),
-            "| Market OPEN",
-            "| Today's candle excluded"
-        )
-
-    else:
-
-        df = df.copy()
-
-        print(
-            "IST:",
-            current_ist.strftime("%Y-%m-%d %H:%M:%S"),
-            "| Market CLOSED",
-            "| Latest completed candle included"
-        )
-
-    return df
-
-
-# ============================================================
-# CHECK FRESH GOLDEN CROSS
-# ============================================================
-
-def check_golden_cross(symbol):
-
-    df = get_stock_data(symbol)
-
-    if df is None:
-
-        return None
-
-    # --------------------------------------------------------
-    # KEEP ONLY COMPLETED DAILY CANDLES
-    # --------------------------------------------------------
-
-    completed = get_completed_daily_data(df)
-
-    if completed is None:
-
-        return None
-
-    if len(completed) < 205:
-
-        return None
-
-    # --------------------------------------------------------
-    # CALCULATE EMA 50
-    # --------------------------------------------------------
-
-    completed["EMA50"] = (
-        completed["Close"]
-        .ewm(
-            span=EMA_FAST,
-            adjust=False
-        )
-        .mean()
-    )
-
-    # --------------------------------------------------------
-    # CALCULATE EMA 200
-    # --------------------------------------------------------
-
-    completed["EMA200"] = (
-        completed["Close"]
-        .ewm(
-            span=EMA_SLOW,
-            adjust=False
-        )
-        .mean()
-    )
-
-    # --------------------------------------------------------
-    # LAST TWO COMPLETED CANDLES
-    # --------------------------------------------------------
-
-    previous = completed.iloc[-2]
-
-    current = completed.iloc[-1]
-
-    previous_50 = float(
-        previous["EMA50"]
-    )
-
-    previous_200 = float(
-        previous["EMA200"]
-    )
-
-    current_50 = float(
-        current["EMA50"]
-    )
-
-    current_200 = float(
-        current["EMA200"]
-    )
-
-    # --------------------------------------------------------
-    # FRESH GOLDEN CROSS
-    #
-    # PREVIOUS:
-    # 50 EMA <= 200 EMA
-    #
-    # CURRENT:
-    # 50 EMA > 200 EMA
-    # --------------------------------------------------------
-
-    fresh_cross = (
-        previous_50 <= previous_200
-        and
-        current_50 > current_200
-    )
-
-    print(
-        f"{symbol}: "
-        f"Previous 50={previous_50:.2f}, "
-        f"Previous 200={previous_200:.2f}, "
-        f"Current 50={current_50:.2f}, "
-        f"Current 200={current_200:.2f}, "
-        f"FreshGolden={fresh_cross}"
-    )
-
-    if not fresh_cross:
-
-        return None
-
-    # --------------------------------------------------------
-    # CROSS DATE
-    # --------------------------------------------------------
-
-    cross_date = current.name
-
-    if hasattr(cross_date, "strftime"):
-
-        cross_date = cross_date.strftime(
-            "%Y-%m-%d"
-        )
-
-    else:
-
-        cross_date = str(cross_date)
-
-    close_price = float(
-        current["Close"]
-    )
-
+    when = recent[recent].index[-1]
     return {
-
-        "symbol": symbol,
-
-        "cross_date": cross_date,
-
-        "close": close_price,
-
-        "ema50": current_50,
-
-        "ema200": current_200
+        "date": when.strftime("%Y-%m-%d"),
+        "close": float(close.loc[when]),
+        "fast": float(close.rolling(FAST).mean().loc[when]),
+        "slow": float(close.rolling(SLOW).mean().loc[when]),
     }
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
+    if not TOKEN or not CHAT_ID:
+        sys.exit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 
-    print("=" * 70)
-    print("NSE FRESH GOLDEN CROSS SCANNER")
-    print("=" * 70)
-
-    current_ist = now_ist()
-
-    print(
-        "India Time:",
-        current_ist.strftime(
-            "%Y-%m-%d %H:%M:%S %Z"
-        )
-    )
-
-    print(
-        "UTC Time:",
-        datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-    )
-
-    print(
-        "Market Status:",
-        "OPEN" if is_market_open_now() else "CLOSED"
-    )
-
-    print("=" * 70)
-
-    state = load_state()
-
-    symbols = get_nse_symbols()
-
-    if not symbols:
-
-        print("No symbols received.")
-
+    if "--test" in sys.argv:
+        send_telegram("✅ Golden Cross bot is connected.")
         return
 
-    new_alerts = 0
+    state = load_state()
+    changed = False
 
-    # --------------------------------------------------------
-    # SCAN ALL STOCKS
-    # --------------------------------------------------------
-
-    for index, symbol in enumerate(
-        symbols,
-        start=1
-    ):
-
-        print(
-            f"[{index}/{len(symbols)}] "
-            f"Checking {symbol}"
-        )
-
-        result = check_golden_cross(
-            symbol
-        )
-
-        if result is None:
-
+    for sym in load_symbols():
+        try:
+            hit = find_fresh_cross(sym)
+        except Exception as e:  # keep scanning other symbols
+            print(f"[error] {sym}: {e}")
+            continue
+        if not hit:
+            print(f"[none] {sym}")
+            continue
+        if state.get(sym, "") >= hit["date"]:
+            print(f"[dup]  {sym} already alerted for {hit['date']}")
             continue
 
-        # ----------------------------------------------------
-        # UNIQUE ALERT
-        #
-        # SAME STOCK + SAME CROSS DATE
-        # = SAME ALERT
-        # ----------------------------------------------------
-
-        alert_key = (
-            f"GOLDEN_"
-            f"{result['symbol']}_"
-            f"{result['cross_date']}"
+        msg = (
+            f"🟡 <b>GOLDEN CROSS</b> — <code>{sym}</code>\n"
+            f"Timeframe: Daily\n"
+            f"SMA{FAST} crossed above SMA{SLOW} on {hit['date']}\n"
+            f"Price: {hit['close']:.2f}\n"
+            f"SMA{FAST}: {hit['fast']:.2f} | SMA{SLOW}: {hit['slow']:.2f}"
         )
-
-        if alert_key in state:
-
-            print(
-                f"{symbol}: already alerted "
-                f"for {result['cross_date']}"
-            )
-
+        try:
+            send_telegram(msg)
+        except Exception as e:
+            print(f"[telegram error] {sym}: {e}")  # not saved -> retried next run
             continue
+        state[sym] = hit["date"]
+        changed = True
+        print(f"[ALERT] {sym} {hit['date']}")
 
-        # ----------------------------------------------------
-        # TELEGRAM MESSAGE
-        # ----------------------------------------------------
+    if changed:
+        STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
-        message = (
-            "🟢 FRESH GOLDEN CROSS\n\n"
-
-            f"📊 Stock: {result['symbol']}\n"
-            f"📅 Cross Date: {result['cross_date']}\n\n"
-
-            f"💰 Close: ₹{result['close']:.2f}\n"
-            f"📈 50 EMA: ₹{result['ema50']:.2f}\n"
-            f"📉 200 EMA: ₹{result['ema200']:.2f}\n\n"
-
-            "✅ 50 EMA crossed ABOVE 200 EMA\n\n"
-
-            "🇮🇳 Timezone: Asia/Kolkata\n\n"
-
-            "🔗 Stock:\n"
-            f"https://finance.yahoo.com/quote/"
-            f"{result['symbol']}.NS/\n\n"
-
-            "🤖 NSE Fresh Golden Cross Scanner"
-        )
-
-        print()
-        print(message)
-        print()
-
-        sent = send_telegram(
-            message
-        )
-
-        if sent:
-
-            state[alert_key] = {
-
-                "symbol":
-                    result["symbol"],
-
-                "cross_date":
-                    result["cross_date"],
-
-                "ema50":
-                    result["ema50"],
-
-                "ema200":
-                    result["ema200"],
-
-                "sent_at":
-                    now_ist().isoformat()
-            }
-
-            save_state(state)
-
-            new_alerts += 1
-
-            print(
-                f"✅ Telegram alert sent: "
-                f"{symbol}"
-            )
-
-        else:
-
-            print(
-                f"❌ Telegram alert failed: "
-                f"{symbol}"
-            )
-
-        time.sleep(0.3)
-
-    print()
-    print("=" * 70)
-    print("SCAN FINISHED")
-    print(
-        "New alerts:",
-        new_alerts
-    )
-    print(
-        "Total saved alerts:",
-        len(state)
-    )
-    print("=" * 70)
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
