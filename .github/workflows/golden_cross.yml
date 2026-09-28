@@ -1,8 +1,9 @@
-name: Golden Cross Alert
+name: Golden Cross Alert (All NSE stocks)
 
 on:
   schedule:
-    - cron: "*/30 * * * 1-5"   # every 30 min, Mon-Fri (UTC)
+    # Every 30 min, Mon-Fri, 08:30-16:00 IST (covers NSE hours 09:15-15:30 IST). Cron is UTC.
+    - cron: "*/30 3-10 * * 1-5"
   workflow_dispatch:
     inputs:
       test:
@@ -20,7 +21,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +36,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # MIN_AVG_VOLUME: "50000"   # uncomment to skip illiquid stocks
         run: |
           if [ "${{ inputs.test }}" = "true" ]; then
             python golden_cross_alert.py --test
@@ -42,12 +44,13 @@ jobs:
             python golden_cross_alert.py
           fi
 
-      - name: Save state (dedupe memory)
+      - name: Save state
         run: |
-          if [ -n "$(git status --porcelain state.json)" ]; then
+          git add state.json nse_equities.txt 2>/dev/null || true
+          if ! git diff --cached --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state.json
             git commit -m "update alert state"
+            git pull --rebase -q || true
             git push
           fi
