@@ -1,4 +1,5 @@
-"""Golden Cross (SMA50 crosses above SMA200) scanner - DAILY timeframe - ALL NSE stocks.
+"""Golden Cross (50 EMA above 200 EMA) + Death Cross (50 EMA below 200 EMA) scanner - DAILY - ALL NSE stocks.
+Set MA_TYPE=SMA for simple averages (default is EMA, matching TradingView 50/200 EMA).
 Sends only fresh alerts to Telegram; dedupes via state.json.
 Usage: python golden_cross_alert.py [--test]
 """
@@ -18,8 +19,11 @@ import yfinance as yf
 
 FAST = int(os.getenv("FAST_MA", 50))
 SLOW = int(os.getenv("SLOW_MA", 200))
+MA_TYPE = os.getenv("MA_TYPE", "EMA").upper()          # EMA (default) or SMA
 FRESH_BARS = int(os.getenv("FRESH_BARS", 1))          # cross must be within last N daily bars
 INCLUDE_LIVE_BAR = os.getenv("INCLUDE_LIVE_BAR", "true").lower() == "true"
+ENABLE_GOLDEN = os.getenv("ENABLE_GOLDEN", "true").lower() == "true"
+ENABLE_DEATH = os.getenv("ENABLE_DEATH", "true").lower() == "true"
 NSE_ALL = os.getenv("NSE_ALL", "true").lower() == "true"
 NSE_SERIES = {s.strip() for s in os.getenv("NSE_SERIES", "EQ").split(",")}
 MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", 0))  # 20-day avg volume filter (0 = off)
@@ -74,31 +78,40 @@ def load_universe():
 
 
 # ---------- signal ----------
+def ma(series, n):
+    if MA_TYPE == "EMA":
+        return series.ewm(span=n, adjust=False).mean()   # same formula TradingView uses
+    return series.rolling(n).mean()
+
+
 def detect_cross(close, volume=None):
-    """Return dict if SMA(FAST) crossed above SMA(SLOW) within last FRESH_BARS bars."""
+    """Return {'golden': hit|None, 'death': hit|None} for crosses within last FRESH_BARS bars."""
+    out = {"golden": None, "death": None}
     close = close.dropna()
     if not INCLUDE_LIVE_BAR and len(close) > 1 and close.index[-1].date() == dt.date.today():
         close = close.iloc[:-1]
     if len(close) < SLOW + 2:
-        return None
-    fast, slow = close.rolling(FAST).mean(), close.rolling(SLOW).mean()
+        return out
+    fast, slow = ma(close, FAST), ma(close, SLOW)
     diff = fast - slow
-    crossed = (diff.shift(1) <= 0) & (diff > 0)
-    recent = crossed.iloc[-FRESH_BARS:]
-    if not recent.any():
-        return None
+    up = (diff.shift(1) <= 0) & (diff > 0)
+    down = (diff.shift(1) >= 0) & (diff < 0)
     if MIN_AVG_VOLUME and volume is not None:
         if volume.reindex(close.index).tail(20).mean() < MIN_AVG_VOLUME:
-            return None
-    when = recent[recent].index[-1]
-    return {"date": when.strftime("%Y-%m-%d"), "close": float(close.loc[when]),
-            "fast": float(fast.loc[when]), "slow": float(slow.loc[when])}
+            return out
+    for kind, series, enabled in (("golden", up, ENABLE_GOLDEN), ("death", down, ENABLE_DEATH)):
+        recent = series.iloc[-FRESH_BARS:]
+        if enabled and recent.any():
+            when = recent[recent].index[-1]
+            out[kind] = {"date": when.strftime("%Y-%m-%d"), "close": float(close.loc[when]),
+                         "fast": float(fast.loc[when]), "slow": float(slow.loc[when])}
+    return out
 
 
 def download(tickers):
     for attempt in range(3):
         try:
-            return yf.download(tickers, period="1y", interval="1d", group_by="ticker",
+            return yf.download(tickers, period="3y", interval="1d", group_by="ticker",
                                auto_adjust=True, threads=True, progress=False)
         except Exception as e:
             print(f"[retry {attempt + 1}] download failed: {e}")
@@ -107,7 +120,7 @@ def download(tickers):
 
 
 def scan(tickers):
-    hits = {}
+    hits = []
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i:i + BATCH_SIZE]
         data = download(batch)
@@ -127,8 +140,9 @@ def scan(tickers):
             except Exception as e:
                 print(f"[error] {t}: {e}")
                 continue
-            if hit:
-                hits[t] = hit
+            for kind, h in hit.items():
+                if h:
+                    hits.append((t, kind, h))
         time.sleep(2)
     return hits
 
@@ -151,18 +165,26 @@ def load_state():
         return {}
 
 
-def line_for(t, h):
+def line_for(t, kind, h):
     name = t.replace(".NS", "")
     link = f"https://www.tradingview.com/chart/?symbol=NSE:{quote(name)}" if t.endswith(".NS") else None
     label = f'<a href="{link}">{html.escape(name)}</a>' if link else html.escape(t)
-    return f"• <b>{label}</b> ₹{h['close']:.2f} | SMA{FAST} {h['fast']:.1f} > SMA{SLOW} {h['slow']:.1f} | {h['date']}"
+    sign = ">" if kind == "golden" else "<"
+    return f"• <b>{label}</b> ₹{h['close']:.2f} | {MA_TYPE}{FAST} {h['fast']:.1f} {sign} {MA_TYPE}{SLOW} {h['slow']:.1f} | {h['date']}"
+
+
+def state_key(t, kind):
+    return t if kind == "golden" else f"{t}|death"   # golden keeps the plain key
+
+
+HEADERS = {"golden": "🟡 <b>GOLDEN CROSS (Daily)</b>", "death": "🔴 <b>DEATH CROSS (Daily)</b>"}
 
 
 def main():
     if not TOKEN or not CHAT_ID:
         sys.exit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
     if "--test" in sys.argv:
-        send_telegram("✅ Golden Cross bot is connected.")
+        send_telegram("✅ Golden/Death Cross bot is connected.")
         return
 
     universe = load_universe()
@@ -170,22 +192,22 @@ def main():
     state = load_state()
     hits = scan(universe)
 
-    fresh = {t: h for t, h in hits.items() if state.get(t, "") < h["date"]}
+    fresh = [(t, k, h) for t, k, h in hits if state.get(state_key(t, k), "") < h["date"]]
     print(f"{len(hits)} crosses found, {len(fresh)} new")
 
-    items = sorted(fresh.items())
-    for i in range(0, len(items), 15):
-        chunk = items[i:i + 15]
-        msg = (f"🟡 <b>GOLDEN CROSS (Daily)</b> — {len(items)} new\n"
-               + "\n".join(line_for(t, h) for t, h in chunk))
-        try:
-            send_telegram(msg)
-        except Exception as e:
-            print(f"[telegram error] {e}")  # not saved -> retried next run
-            continue
-        for t, h in chunk:
-            state[t] = h["date"]
-        time.sleep(1.5)
+    for kind in ("golden", "death"):
+        items = sorted((t, h) for t, k, h in fresh if k == kind)
+        for i in range(0, len(items), 15):
+            chunk = items[i:i + 15]
+            msg = f"{HEADERS[kind]} — {len(items)} new\n" + "\n".join(line_for(t, kind, h) for t, h in chunk)
+            try:
+                send_telegram(msg)
+            except Exception as e:
+                print(f"[telegram error] {e}")  # not saved -> retried next run
+                continue
+            for t, h in chunk:
+                state[state_key(t, kind)] = h["date"]
+            time.sleep(1.5)
 
     new_text = json.dumps(state, indent=2, sort_keys=True)
     if not STATE_FILE.exists() or STATE_FILE.read_text() != new_text:
