@@ -1,0 +1,2 @@
+# OPTIONAL extra tickers (Yahoo format) scanned in addition to ALL NSE stocks.
+# BSE = .BO, US = plain (AAPL), indices = ^NSEI. Leave empty if not needed.
