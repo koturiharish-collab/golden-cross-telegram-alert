@@ -2,8 +2,9 @@ name: Golden Cross Alert (All NSE stocks)
 
 on:
   schedule:
-    # Every 30 min, Mon-Fri, 08:30-16:00 IST (covers NSE hours 09:15-15:30 IST). Cron is UTC.
-    - cron: "*/30 3-10 * * 1-5"
+    # Once a day, Mon-Fri, 16:17 IST (after NSE close 15:30). Cron is UTC.
+    # Odd minute (47) avoids the busiest GitHub slots, so runs get dropped less.
+    - cron: "47 10 * * 1-5"
   workflow_dispatch:
     inputs:
       test:
@@ -54,3 +55,20 @@ jobs:
             git pull --rebase -q || true
             git push
           fi
+
+      # Heartbeat: if you get no message on a weekday, the job didn't run.
+      - name: Heartbeat
+        if: always() && inputs.test != true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" = "success" ]; then
+            MSG="✅ Golden Cross scan finished ($(TZ=Asia/Kolkata date '+%d %b %H:%M IST'))"
+          else
+            MSG="❌ Golden Cross scan FAILED - check GitHub Actions logs"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="${MSG}" > /dev/null
