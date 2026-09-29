@@ -2,9 +2,8 @@ name: Golden Cross Alert (All NSE stocks)
 
 on:
   schedule:
-    # Once a day, Mon-Fri, 16:17 IST (after NSE close 15:30). Cron is UTC.
-    # Odd minute (47) avoids the busiest GitHub slots, so runs get dropped less.
-    - cron: "47 10 * * 1-5"
+    # Every 30 min, Mon-Fri, 08:47-16:17 IST. Cron is UTC. Odd minutes get skipped less.
+    - cron: "17,47 3-10 * * 1-5"
   workflow_dispatch:
     inputs:
       test:
@@ -46,6 +45,7 @@ jobs:
           fi
 
       - name: Save state
+        if: always()
         run: |
           git add state.json nse_equities.txt 2>/dev/null || true
           if ! git diff --cached --quiet; then
@@ -56,18 +56,21 @@ jobs:
             git push
           fi
 
-      # Heartbeat: if you get no message on a weekday, the job didn't run.
-      - name: Heartbeat
+      # ❌ on any failure. ✅ only from the last scheduled run of the day (16:00 IST or later).
+      - name: Telegram status
         if: always() && inputs.test != true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JOB_STATUS: ${{ job.status }}
         run: |
-          if [ "$JOB_STATUS" = "success" ]; then
-            MSG="✅ Golden Cross scan finished ($(TZ=Asia/Kolkata date '+%d %b %H:%M IST'))"
-          else
+          HOUR=$(TZ=Asia/Kolkata date +%H)
+          if [ "$JOB_STATUS" != "success" ]; then
             MSG="❌ Golden Cross scan FAILED - check GitHub Actions logs"
+          elif [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$HOUR" -ge 16 ]; then
+            MSG="✅ Golden Cross: last scan of the day done ($(TZ=Asia/Kolkata date '+%d %b %H:%M IST'))"
+          else
+            exit 0
           fi
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
