@@ -4,6 +4,7 @@ Sends only fresh alerts to Telegram; dedupes via state.json.
 Usage: python golden_cross_alert.py [--test]
 """
 import datetime as dt
+import base64
 import html
 import io
 import json
@@ -180,6 +181,103 @@ def state_key(t, kind):
 HEADERS = {"golden": "🟡 <b>GOLDEN CROSS (Daily)</b>", "death": "🔴 <b>DEATH CROSS (Daily)</b>"}
 
 
+
+def publish_to_sharesanket(hits):
+    """Merge fresh cross signals into Share Sanket without replacing existing alerts."""
+    token = os.getenv("SHARE_SANKET_TOKEN", "")
+    if not token:
+        print("[Share Sanket] SHARE_SANKET_TOKEN is not configured; website feed skipped")
+        return
+
+    repo = os.getenv("SHARE_SANKET_REPO", "sharesanket/corporate-actions.yml")
+    branch = os.getenv("SHARE_SANKET_BRANCH", "main")
+    api_url = f"https://api.github.com/repos/{repo}/contents/alerts.json"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    now = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30))).isoformat()
+
+    # Each signal ID is stable, so reruns cannot add the same stock/cross/date twice.
+    new_alerts = []
+    for ticker, kind, hit in hits:
+        symbol = ticker.replace(".NS", "")
+        signal_id = f"ema-{kind}-{symbol}-{hit['date']}".lower()
+        tradingview = f"https://www.tradingview.com/chart/?symbol=NSE:{quote(symbol)}"
+        is_golden = kind == "golden"
+        new_alerts.append({
+            "id": signal_id,
+            "time": now,
+            "folder": "emas",
+            "subfolder": kind,
+            "symbol": symbol,
+            "company": symbol,
+            "title": "Golden Cross (Daily)" if is_golden else "Death Cross (Daily)",
+            "price": round(hit["close"], 2),
+            "change_pct": None,
+            "details": [
+                {"label": "Signal date", "value": hit["date"], "source": "Yahoo Finance"},
+                {"label": f"{MA_TYPE}{FAST}", "value": round(hit["fast"], 4), "source": "Yahoo Finance"},
+                {"label": f"{MA_TYPE}{SLOW}", "value": round(hit["slow"], 4), "source": "Yahoo Finance"},
+                {"label": "Timeframe", "value": "Daily", "source": "Scanner"},
+                {"label": "Signal definition",
+                 "value": f"{MA_TYPE}{FAST} {'above' if is_golden else 'below'} {MA_TYPE}{SLOW}",
+                 "source": "Scanner"},
+            ],
+            "link": tradingview,
+        })
+
+    if not new_alerts:
+        print("[Share Sanket] No fresh EMA cross signals to publish")
+        return
+
+    for attempt in range(3):
+        try:
+            current = requests.get(api_url, headers=headers, params={"ref": branch}, timeout=30)
+            current.raise_for_status()
+            remote = current.json()
+            data = json.loads(base64.b64decode(remote["content"]).decode("utf-8"))
+            if not isinstance(data.get("alerts"), list):
+                raise ValueError("alerts.json does not contain an alerts list")
+
+            known_ids = {str(item.get("id")) for item in data["alerts"]}
+            additions = [item for item in new_alerts if item["id"] not in known_ids]
+            if not additions:
+                print("[Share Sanket] All detected signals are already published")
+                return
+
+            data["alerts"] = additions + data["alerts"]
+            data["updated"] = now
+            encoded = base64.b64encode(
+                json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            ).decode("ascii")
+            saved = requests.put(
+                api_url,
+                headers=headers,
+                json={
+                    "message": f"Publish {len(additions)} fresh EMA cross alert(s)",
+                    "content": encoded,
+                    "sha": remote["sha"],
+                    "branch": branch,
+                },
+                timeout=30,
+            )
+            if saved.status_code in (409, 422) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            saved.raise_for_status()
+            print(f"[Share Sanket] Published {len(additions)} fresh EMA cross alert(s)")
+            return
+        except Exception as exc:
+            if attempt == 2:
+                print(f"[Share Sanket] Publish failed: {exc}")
+            else:
+                print(f"[Share Sanket] Retry {attempt + 1}: {exc}")
+                time.sleep(2 * (attempt + 1))
+
+
+
 def main():
     if not TOKEN or not CHAT_ID:
         sys.exit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
@@ -191,6 +289,7 @@ def main():
     print(f"Scanning {len(universe)} tickers")
     state = load_state()
     hits = scan(universe)
+    publish_to_sharesanket(hits)
 
     fresh = [(t, k, h) for t, k, h in hits if state.get(state_key(t, k), "") < h["date"]]
     print(f"{len(hits)} crosses found, {len(fresh)} new")
